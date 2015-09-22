@@ -16,7 +16,6 @@
  * Foundation, 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <linux/cpu.h>
 #include <linux/cpu_pm.h>
 #include <linux/errno.h>
 #include <linux/err.h>
@@ -61,6 +60,8 @@ static atomic64_t kvm_vmid_gen = ATOMIC64_INIT(1);
 static u8 kvm_next_vmid;
 static DEFINE_SPINLOCK(kvm_vmid_lock);
 
+static DEFINE_PER_CPU(unsigned char, kvm_arm_hardware_enabled);
+
 static void kvm_arm_set_running_vcpu(struct kvm_vcpu *vcpu)
 {
 	BUG_ON(preemptible());
@@ -83,11 +84,6 @@ struct kvm_vcpu *kvm_arm_get_running_vcpu(void)
 struct kvm_vcpu * __percpu *kvm_get_running_vcpus(void)
 {
 	return &kvm_arm_running_vcpu;
-}
-
-int kvm_arch_hardware_enable(void)
-{
-	return 0;
 }
 
 int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
@@ -976,36 +972,59 @@ static void cpu_init_hyp_mode(void *dummy)
 	kvm_arm_init_debug();
 }
 
-static int hyp_init_cpu_notify(struct notifier_block *self,
-			       unsigned long action, void *cpu)
+static void cpu_reset_hyp_mode(void *dummy)
 {
-	switch (action) {
-	case CPU_STARTING:
-	case CPU_STARTING_FROZEN:
-		if (__hyp_get_vectors() == hyp_default_vectors)
-			cpu_init_hyp_mode(NULL);
-		break;
-	}
+	phys_addr_t boot_pgd_ptr;
+	phys_addr_t phys_idmap_start;
 
-	return NOTIFY_OK;
+	boot_pgd_ptr = kvm_mmu_get_boot_httbr();
+	phys_idmap_start = kvm_get_idmap_start();
+
+	__cpu_reset_hyp_mode(boot_pgd_ptr, phys_idmap_start);
 }
 
-static struct notifier_block hyp_init_cpu_nb = {
-	.notifier_call = hyp_init_cpu_notify,
-};
+int kvm_arch_hardware_enable(void)
+{
+	if (__hyp_get_vectors() == hyp_default_vectors)
+		cpu_init_hyp_mode(NULL);
+
+	return 0;
+}
+
+void kvm_arch_hardware_disable(void)
+{
+	if (__hyp_get_vectors() == hyp_default_vectors)
+		return;
+
+	cpu_reset_hyp_mode(NULL);
+}
 
 #ifdef CONFIG_CPU_PM
 static int hyp_init_cpu_pm_notifier(struct notifier_block *self,
 				    unsigned long cmd,
 				    void *v)
 {
-	if (cmd == CPU_PM_EXIT &&
-	    __hyp_get_vectors() == hyp_default_vectors) {
-		cpu_init_hyp_mode(NULL);
-		return NOTIFY_OK;
-	}
+	switch (cmd) {
+	case CPU_PM_ENTER:
+		if (__hyp_get_vectors() != hyp_default_vectors)
+			__this_cpu_write(kvm_arm_hardware_enabled, 1);
+		else
+			__this_cpu_write(kvm_arm_hardware_enabled, 0);
+		/*
+		 * don't call kvm_arch_hardware_disable() in case of
+		 * CPU_PM_ENTER because it does't actually save any state.
+		 */
 
-	return NOTIFY_DONE;
+		return NOTIFY_OK;
+	case CPU_PM_EXIT:
+		if (__this_cpu_read(kvm_arm_hardware_enabled))
+			kvm_arch_hardware_enable();
+
+		return NOTIFY_OK;
+
+	default:
+		return NOTIFY_DONE;
+	}
 }
 
 static struct notifier_block hyp_init_cpu_pm_nb = {
@@ -1104,6 +1123,7 @@ static int init_hyp_mode(void)
 
 	/*
 	 * Execute the init code on each CPU.
+	 * Only needed to execute kvm_hyp_call() during *_hyp_init().
 	 */
 	on_each_cpu(cpu_init_hyp_mode, NULL, 1);
 
@@ -1121,6 +1141,8 @@ static int init_hyp_mode(void)
 	if (err)
 		goto out_free_context;
 
+	on_each_cpu(cpu_reset_hyp_mode, NULL, 1);
+
 #ifndef CONFIG_HOTPLUG_CPU
 	free_boot_hyp_pgd();
 #endif
@@ -1131,6 +1153,7 @@ static int init_hyp_mode(void)
 
 	return 0;
 out_free_context:
+	on_each_cpu(cpu_reset_hyp_mode, NULL, 1);
 	free_percpu(kvm_host_cpu_state);
 out_free_mappings:
 	free_hyp_pgds();
@@ -1181,26 +1204,15 @@ int kvm_arch_init(void *opaque)
 		}
 	}
 
-	cpu_notifier_register_begin();
-
 	err = init_hyp_mode();
 	if (err)
 		goto out_err;
-
-	err = __register_cpu_notifier(&hyp_init_cpu_nb);
-	if (err) {
-		kvm_err("Cannot register HYP init CPU notifier (%d)\n", err);
-		goto out_err;
-	}
-
-	cpu_notifier_register_done();
 
 	hyp_cpu_pm_init();
 
 	kvm_coproc_table_init();
 	return 0;
 out_err:
-	cpu_notifier_register_done();
 	return err;
 }
 
