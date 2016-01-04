@@ -13,8 +13,16 @@
 
 #include <asm/assembler.h>
 #include <asm/kexec.h>
+#include <asm/memory.h>
 #include <asm/page.h>
-#include <asm/sysreg.h>
+
+#ifdef CONFIG_KEXEC_HARDBOOT
+/* virt PSCI specific */
+#define PSCI_0_2_FN_SYSTEM_RESET (0x84000000 + 9)
+#endif
+
+.data
+
 
 /*
  * arm64_relocate_new_kernel - Put a 2nd stage image in place and boot it.
@@ -31,102 +39,170 @@
 .globl arm64_relocate_new_kernel
 arm64_relocate_new_kernel:
 
-	/* Setup the list loop variables. */
-	mov	x19, x2				/* x19 = dtb */
-	mov	x18, x1				/* x18 = kimage_start */
-	mov	x17, x0				/* x17 = kimage_head */
-	dcache_line_size x16, x0		/* x16 = dcache line size */
-	mov	x15, xzr			/* x15 = segment start */
-	mov	x14, xzr			/* x14 = entry ptr */
-	mov	x13, xzr			/* x13 = copy dest */
+	ldr	x22, =KEXEC_HB_PAGE_ADDR
+	ldr	x23, =(0xdeaf0000)
+	str	x23, [x22]
 
-	/* Clear the sctlr_el2 flags. */
-	mrs	x0, CurrentEL
-	cmp	x0, #CurrentEL_EL2
-	b.ne	1f
-	mrs	x0, sctlr_el2
-	ldr	x1, =SCTLR_ELx_FLAGS
-	bic	x0, x0, x1
-	msr	sctlr_el2, x0
-	isb
-1:
+	/* Setup the list loop variables. */
+	ldr	x18, arm64_kexec_kimage_head	/* x18 = list entry */
+	dcache_line_size x17, x0		/* x17 = dcache line size */
+	mov	x16, xzr			/* x16 = segment start */
+	mov	x15, xzr			/* x15 = entry ptr */
+	mov	x14, xzr			/* x14 = copy dest */
 
 	/* Check if the new image needs relocation. */
-	cbz	x17, .Ldone
-	tbnz	x17, IND_DONE_BIT, .Ldone
+	cbz	x18, .Ldone
+	tbnz	x18, IND_DONE_BIT, .Ldone
 
 .Lloop:
-	and	x12, x17, PAGE_MASK		/* x12 = addr */
+	and	x13, x18, PAGE_MASK		/* x13 = addr */
 
 	/* Test the entry flags. */
 .Ltest_source:
-	tbz	x17, IND_SOURCE_BIT, .Ltest_indirection
+	tbz	x18, IND_SOURCE_BIT, .Ltest_indirection
+
+	mov x20, x14				/*  x20 = copy dest */
+	mov x21, x13				/*  x21 = copy src */
 
 	/* Invalidate dest page to PoC. */
-	mov     x0, x13
-	add     x20, x0, #PAGE_SIZE
-	sub     x1, x16, #1
-	bic     x0, x0, x1
-2:	dc      ivac, x0
-	add     x0, x0, x16
-	cmp     x0, x20
-	b.lo    2b
-	dsb     sy
+	mov	x0, x20
+	add	x19, x0, #PAGE_SIZE
+	sub	x1, x17, #1
+	bic	x0, x0, x1
+1:	dc	ivac, x0
+	add	x0, x0, x17
+	cmp	x0, x19
+	b.lo	1b
+	dsb	sy
 
-	mov x20, x13
-	mov x21, x12
-	copy_page x20, x21, x0, x1, x2, x3, x4, x5, x6, x7
+	/* Copy page. */
+1:	ldp	x22, x23, [x21]
+	ldp	x24, x25, [x21, #16]
+	ldp	x26, x27, [x21, #32]
+	ldp	x28, x29, [x21, #48]
+	add	x21, x21, #64
+	stnp	x22, x23, [x20]
+	stnp	x24, x25, [x20, #16]
+	stnp	x26, x27, [x20, #32]
+	stnp	x28, x29, [x20, #48]
+	add	x20, x20, #64
+	tst	x21, #(PAGE_SIZE - 1)
+	b.ne	1b
 
 	/* dest += PAGE_SIZE */
-	add	x13, x13, PAGE_SIZE
+	add	x14, x14, PAGE_SIZE
 	b	.Lnext
 
 .Ltest_indirection:
-	tbz	x17, IND_INDIRECTION_BIT, .Ltest_destination
+	tbz	x18, IND_INDIRECTION_BIT, .Ltest_destination
 
 	/* ptr = addr */
-	mov	x14, x12
+	mov	x15, x13
 	b	.Lnext
 
 .Ltest_destination:
-	tbz	x17, IND_DESTINATION_BIT, .Lnext
+	tbz	x18, IND_DESTINATION_BIT, .Lnext
 
-	mov	x15, x12
+	mov	x16, x13
 
 	/* dest = addr */
-	mov	x13, x12
+	mov	x14, x13
 
 .Lnext:
 	/* entry = *ptr++ */
-	ldr	x17, [x14], #8
+	ldr	x18, [x15], #8
+
+	ldr	x22, =KEXEC_HB_PAGE_ADDR
+	ldr	x23, [x22]
+	add	x23, x23, #1
+	str	x23, [x22]
 
 	/* while (!(entry & DONE)) */
-	tbz	x17, IND_DONE_BIT, .Lloop
+	tbz	x18, IND_DONE_BIT, .Lloop
 
 .Ldone:
-	dsb	nsh
-	ic	iallu
-	dsb	nsh
+	dsb	sy
+	isb
+	ic	ialluis
+	dsb	sy
 	isb
 
+#ifdef CONFIG_KEXEC_HARDBOOT
+	ldr	x0, arm64_kexec_hardboot
+	cbnz	x0, hardboot
+#endif
+	ldr	x22, =KEXEC_HB_PAGE_ADDR
+	ldr	x23, =(0xfeedf00d)
+	str	x23, [x22]
+
 	/* Start new image. */
-	mov	x0, x19
+	ldr	x4, arm64_kexec_kimage_start
+	ldr	x0, arm64_kexec_dtb_addr
+	str	x4, [x22, #8]
+	str	x0, [x22, #16]
+	str	xzr, [x22, #24]
 	mov	x1, xzr
 	mov	x2, xzr
 	mov	x3, xzr
-	br	x18
+	br	x4
 
+#ifdef CONFIG_KEXEC_HARDBOOT
+hardboot:
+	/* Stash boot arguments in hardboot page:
+	 * 0: KEXEC_HB_PAGE_MAGIC
+	 * 8: kexec_kimage_start
+	 */
+	ldr	x0, =KEXEC_HB_PAGE_ADDR
+	ldr	x1, =KEXEC_HB_PAGE_MAGIC
+	str	x1, [x0]
+	/* Processor specific reboot code. */
+	/* virt PSCI hypercall. */
+	ldr	x0, =PSCI_0_2_FN_SYSTEM_RESET
+	hvc	#0
+loop:	b	loop
 .ltorg
+#endif
 
 .align 3	/* To keep the 64-bit values below naturally aligned. */
 
-.Lcopy_end:
-.org	KEXEC_CONTROL_PAGE_SIZE
+/* The machine_kexec routines set these variables. */
 
 /*
- * arm64_relocate_new_kernel_size - Number of bytes to copy to the
- * control_code_page.
+ * arm64_kexec_kimage_start - Copy of image->start, the entry point of the new
+ * image.
+ */
+.globl arm64_kexec_kimage_start
+arm64_kexec_kimage_start:
+	.quad	0x0
+
+/*
+ * arm64_kexec_dtb_addr - Physical address of a device tree.
+ */
+.globl arm64_kexec_dtb_addr
+arm64_kexec_dtb_addr:
+	.quad	0x0
+
+/*
+ * arm64_kexec_kimage_head - Copy of image->head, the list of kimage entries.
+ */
+.globl arm64_kexec_kimage_head
+arm64_kexec_kimage_head:
+	.quad	0x0
+
+/*
+ * arm64_kexec_hardboot - set to true if booting in hardboot mode
+ */
+.globl arm64_kexec_hardboot
+arm64_kexec_hardboot:
+	.quad	0x0
+
+.Lrelocate_new_kernel_end:
+
+/*
+ * relocate_new_kernel_size - Number of bytes to copy to the control_code_page.
  */
 .globl arm64_relocate_new_kernel_size
 arm64_relocate_new_kernel_size:
-	.quad	.Lcopy_end - arm64_relocate_new_kernel
+	.quad .Lrelocate_new_kernel_end - arm64_relocate_new_kernel
+
+.org	KEXEC_CONTROL_PAGE_SIZE

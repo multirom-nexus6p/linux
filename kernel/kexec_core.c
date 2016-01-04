@@ -278,6 +278,12 @@ int kimage_is_destination_range(struct kimage *image,
 			return 1;
 	}
 
+#ifdef CONFIG_KEXEC_HARDBOOT
+	/* FIXME: This is a horrible hack, the second buffer should be allocated properly */
+	if (arch_kexec_is_hardboot_buffer_range(start, end))
+		return 1;
+#endif
+
 	return 0;
 }
 
